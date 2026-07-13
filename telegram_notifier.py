@@ -1,0 +1,19 @@
+"""Отправка уведомлений в Telegram через бота."""
+
+from __future__ import annotations
+
+import requests
+
+
+class TelegramNotifier:
+    def __init__(self, bot_token: str, chat_id: str):
+        self._url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        self._chat_id = chat_id
+
+    def send(self, text: str) -> None:
+        response = requests.post(
+            self._url,
+            json={"chat_id": self._chat_id, "text": text},
+            timeout=15,
+        )
+        response.raise_for_status()

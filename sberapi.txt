@@ -1,0 +1,155 @@
+School21 OpenAPI Specification
+
+[ Base URL: https://platform.21-school.ru/services/21-school/api/v1 ]
+
+Step 1
+
+·
+
+To get an access token (JWT) you need to send a POST request to the Access Token URL (https://auth.21-school.ru/auth/realms/EduPowerKeycloak/protocol/openid-connect/token). In the request body you need to specify the values for the following parameters: "username" (=$login), "password" (=$password), "grant_type" (="password"), and "client_id" (="s21-open-api"). These values should be sent as URL-encoded data (x-www-form-urlencoded).
+
+Curl
+
+curl -L "https://auth.21-school.ru/auth/realms/EduPowerKeycloak/protocol/openid-connect/token" \
+-H 'Content-Type: application/x-www-form-urlencoded' \
+-d 'client_id=s21-open-api' \
+-d 'username=$LOGIN' \
+-d 'password=$PASSWORD' \
+-d 'grant_type=password'
+
+Step 2
+
+·
+
+In case of successful authentication, the response will include an access token and a refresh token
+
+Step 3
+
+·
+
+Use the access token to send requests to the API. Place it in the Authorization header (Bearer $token) to authenticate your application
+GET
+
+/v1/campuses
+
+Returns a list of campuses
+GET
+
+/v1/campuses/{campusId}/participants
+
+Returns a list of participants in a campus by ID
+GET
+
+/v1/campuses/{campusId}/coalitions
+
+Returns a list of coalitions in a campus by ID
+GET
+
+/v1/campuses/{campusId}/clusters
+
+Returns a list of clusters in a campus by ID
+GET
+
+/v1/clusters/{clusterId}/map
+
+Returns a cluster map
+GET
+
+/v1/events
+
+Returns a list of events
+GET
+
+/v1/sales
+
+Returns current sales’ statuses within parallel
+GET
+
+/v1/projects/{projectId}
+
+Returns project information by ID
+GET
+
+/v1/projects/{projectId}/participants
+
+Returns a list of participants by project ID
+GET
+
+/v1/coalitions/{coalitionId}/participants
+
+Returns a list of participants in a coalition by ID
+GET
+
+/v1/participants/{login}
+
+Returns basic participant information by login
+GET
+
+/v1/participants/{login}/workstation
+
+Returns a participant workstation by login
+GET
+
+/v1/participants/{login}/skills
+
+Returns participant skill points by login
+GET
+
+/v1/participants/{login}/projects
+
+Returns participant projects information by login
+GET
+
+/v1/participants/{login}/projects/{projectId}
+
+Returns participant project information by ID
+GET
+
+/v1/participants/{login}/points
+
+Returns participant points information by login
+GET
+
+/v1/participants/{login}/logtime
+
+Returns an average week logtime by login
+GET
+
+/v1/participants/{login}/feedback
+
+Returns average participant feedback points by login
+GET
+
+/v1/participants/{login}/experience-history
+
+Returns a list of participant XP accruals by login
+GET
+
+/v1/participants/{login}/courses
+
+Returns participant courses information by login
+GET
+
+/v1/participants/{login}/courses/{courseId}
+
+Returns participant course information by ID
+GET
+
+/v1/participants/{login}/coalition
+
+Returns participant coalition information by login
+GET
+
+/v1/participants/{login}/badges
+
+Returns a list of participant badges by login
+GET
+
+/v1/courses/{courseId}
+
+Returns course information by ID
+GET
+
+/v1/graph
+
+Returns a participant projects map

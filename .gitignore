@@ -1,0 +1,11 @@
+# Секреты
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Данные и логи бота
+state.json
+*.log
