@@ -8,6 +8,7 @@ import requests
 
 AUTH_URL = "https://auth.21-school.ru/auth/realms/EduPowerKeycloak/protocol/openid-connect/token"
 API_BASE = "https://platform.21-school.ru/services/21-school/api/v1"
+STORAGE_BASE = "https://platform.21-school.ru/services/storage/download"
 CLIENT_ID = "s21-open-api"
 
 
@@ -73,6 +74,22 @@ class School21Client:
     def get(self, path: str, params: dict | None = None) -> dict:
         """Универсальный GET к любому эндпоинту /v1/..."""
         return self._get(path, params)
+
+    def download(self, storage_path: str) -> bytes:
+        """Скачивает файл из хранилища платформы (например, iconUrl бейджа).
+
+        Пути вида /public_any/... требуют Bearer-токен, поэтому просто
+        отдать ссылку Telegram нельзя — качаем сами.
+        """
+        token = self._ensure_token()
+        response = requests.get(
+            f"{STORAGE_BASE}{storage_path}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=40,
+        )
+        if not response.ok:
+            raise School21Error(f"GET storage {storage_path} failed [{response.status_code}]")
+        return response.content
 
     def participant(self, login: str) -> dict:
         return self._get(f"/participants/{login}")

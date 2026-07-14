@@ -14,6 +14,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -24,12 +25,14 @@ from dotenv import load_dotenv
 from school21_client import School21Client, School21Error
 
 load_dotenv()
+sys.stdout.reconfigure(line_buffering=True)  # лог виден сразу, даже при выводе в файл
 
 TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
 TG_CHAT_ID = int(os.environ["TG_CHAT_ID"])
 S21_LOGIN = os.environ["S21_LOGIN"]
 S21_PASSWORD = os.environ["S21_PASSWORD"]
-ME = os.environ.get("S21_TRACK_LOGIN", S21_LOGIN)
+DEFAULT_ME = os.environ.get("S21_TRACK_LOGIN", S21_LOGIN)
+ME = DEFAULT_ME  # может быть переопределён командой /track (хранится в state.json)
 
 TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
@@ -44,13 +47,12 @@ def tg(method: str, **kwargs) -> dict:
 
 
 def send(text: str, keyboard: list | None = None) -> None:
-    tg(
-        "sendMessage",
-        chat_id=TG_CHAT_ID,
-        text=text,
-        parse_mode="HTML",
-        reply_markup={"inline_keyboard": keyboard} if keyboard else None,
-    )
+    kwargs = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
+    if keyboard:
+        kwargs["reply_markup"] = {"inline_keyboard": keyboard}
+    result = tg("sendMessage", **kwargs)
+    if not result.get("ok"):
+        print("sendMessage:", result.get("description"))
 
 
 def edit(message_id: int, text: str, keyboard: list) -> None:
@@ -79,6 +81,40 @@ def send_result(title: str, body: str, extra_buttons: list | None = None) -> Non
     send(f"<b>{html.escape(title)}</b>\n{body}", keyboard)
 
 
+def send_album(photos: list[tuple[bytes, str]], summary: str) -> None:
+    """Все картинки одним альбомом (sendMediaGroup) + одно сообщение с кнопкой
+    удаления всего сразу. Картинки качаем сами: ссылки платформы требуют токен.
+    """
+    media, files = [], {}
+    for i, (content, caption) in enumerate(photos[:10]):  # лимит Telegram — 10 фото в альбоме
+        key = f"p{i}"
+        files[key] = (f"{key}.png", content)
+        media.append({"type": "photo", "media": f"attach://{key}", "caption": caption, "parse_mode": "HTML"})
+
+    response = requests.post(
+        f"{TG_API}/sendMediaGroup",
+        data={"chat_id": TG_CHAT_ID, "media": json.dumps(media)},
+        files=files,
+        timeout=120,
+    ).json()
+    if not response.get("ok"):
+        print("sendMediaGroup:", response.get("description"))
+        send_result("Альбом", summary)
+        return
+
+    token = str(int(time.time() * 1000))
+    ids = [m["message_id"] for m in response["result"]]
+
+    def _remember(s: dict) -> None:
+        albums = s.setdefault("albums", {})
+        albums[token] = ids
+        for old in sorted(albums)[:-20]:  # не копим бесконечно
+            del albums[old]
+
+    update_state(_remember)
+    send(summary, [[{"text": "🗑 Удалить всё", "callback_data": f"delA:{token}"}]])
+
+
 def fmt_json(data) -> str:
     text = json.dumps(data, ensure_ascii=False, indent=2)
     if len(text) > 3400:
@@ -92,17 +128,19 @@ def kb(rows: list[list[tuple[str, str]]]) -> list:
     return [[{"text": t, "callback_data": d} for t, d in row] for row in rows]
 
 
-MAIN_MENU = (
-    f"🏠 <b>School21 — {ME}</b>\nВыбирай раздел:",
-    kb([
-        [("👤 Профиль", "m:profile"), ("📁 Проекты", "m:projects")],
-        [("🎓 Курсы", "a:courses"), ("📅 События (14 дней)", "a:events")],
-        [("🏫 Кампусы", "m:campus"), ("💸 Продажи", "a:sales")],
-        [("🗺 Граф проектов", "a:graph")],
-        [("🔍 ПИНГ: проверки (важно!)", "a:ping_reviews")],
-        [("🧘 ПИНГ: события кампуса", "a:ping_events")],
-    ]),
-)
+def main_menu() -> tuple[str, list]:
+    return (
+        f"🏠 <b>School21 — {ME}</b>\nВыбирай раздел:\n"
+        f"<i>/track ник — следить за другим, /track — вернуть свой</i>",
+        kb([
+            [("👤 Профиль", "m:profile"), ("📁 Проекты", "m:projects")],
+            [("🎓 Курсы", "a:courses"), ("📅 События (14 дней)", "a:events")],
+            [("🏫 Кампусы", "m:campus"), ("💸 Продажи", "a:sales")],
+            [("🗺 Граф проектов", "a:graph")],
+            [("🔍 ПИНГ: проверки (важно!)", "a:ping_reviews")],
+            [("🧘 ПИНГ: события кампуса", "a:ping_events")],
+        ]),
+    )
 
 PROFILE_MENU = (
     "👤 <b>Профиль</b> — что глянуть:",
@@ -155,6 +193,9 @@ def iso(dt: datetime) -> str:
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
+# state.json пишут два потока (бот и watcher) — без лока они затирают правки друг друга
+STATE_LOCK = threading.Lock()
+
 
 def load_state() -> dict:
     try:
@@ -169,13 +210,47 @@ def save_state(state: dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=1)
 
 
+def update_state(mutate) -> dict:
+    """Атомарно: перечитать state, применить mutate(state), сохранить."""
+    with STATE_LOCK:
+        state = load_state()
+        mutate(state)
+        save_state(state)
+        return state
+
+
+def set_track(login: str | None) -> None:
+    """Сменить отслеживаемый ник (пусто — вернуть свой). Хранится в state.json навсегда."""
+    global ME
+    ME = (login or "").strip() or DEFAULT_ME
+    update_state(lambda s: s.__setitem__("track_login", ME))
+
+
+# восстанавливаем выбранный ник после перезапуска
+ME = load_state().get("track_login") or DEFAULT_ME
+
+
+def fetch_all_projects(status: str | None = None, login: str | None = None) -> list[dict]:
+    """Все проекты с пагинацией — их может быть сильно больше одной страницы."""
+    items: list[dict] = []
+    offset, limit = 0, 100
+    while True:
+        params = {"limit": limit, "offset": offset}
+        if status:
+            params["status"] = status
+        page = client.get(f"/participants/{login or ME}/projects", params).get("projects") or []
+        items.extend(page)
+        if len(page) < limit:
+            return items
+        offset += limit
+
+
 def action_ping_reviews() -> None:
     """Проверки: кричим только про НОВЫЕ IN_REVIEWS с прошлого пинга."""
-    reviews = client.get(f"/participants/{ME}/projects", {"status": "IN_REVIEWS", "limit": 50})
-    items = reviews.get("projects") or []
+    items = fetch_all_projects("IN_REVIEWS")
 
     state = load_state()
-    known: dict = state.get("in_reviews", {})
+    known: dict = state.get("in_reviews_by_login", {}).get(ME, {})
     today = datetime.now(timezone.utc).strftime("%d.%m %H:%M")
 
     current_ids = set()
@@ -191,8 +266,9 @@ def action_ping_reviews() -> None:
             new_lines.append(f"• <b>{title}</b>")
 
     # выкидываем из памяти то, что из проверок уже ушло
-    state["in_reviews"] = {pid: seen for pid, seen in known.items() if pid in current_ids}
-    save_state(state)
+    update_state(lambda s: s.setdefault("in_reviews_by_login", {}).__setitem__(
+        ME, {pid: seen for pid, seen in known.items() if pid in current_ids}
+    ))
 
     parts = []
     if new_lines:
@@ -226,11 +302,7 @@ def action_ping_events() -> None:
 
 
 def action_projects(status: str) -> None:
-    params = {"limit": 50}
-    if status != "ALL":
-        params["status"] = status
-    data = client.get(f"/participants/{ME}/projects", params)
-    items = data.get("projects") or []
+    items = fetch_all_projects(None if status == "ALL" else status)
     if not items:
         send_result(f"Проекты [{status}]", "Пусто.")
         return
@@ -252,6 +324,34 @@ def action_clusters(campus_id: str) -> None:
     send_result("Кластеры кампуса", "\n".join(lines) or "Пусто.", map_buttons)
 
 
+def action_badges() -> None:
+    """Бейджи: иконки одним альбомом, список и удаление — одним сообщением."""
+    badges = client.get(f"/participants/{ME}/badges").get("badges") or []
+    if not badges:
+        send_result("🎖 Бейджи", "Пусто.")
+        return
+
+    summary = f"<b>🎖 Бейджи {ME} ({len(badges)})</b>\n" + "\n".join(
+        f"• <b>{html.escape(str(b.get('name')))}</b> — {str(b.get('receiptDateTime') or '')[:10]}"
+        for b in badges
+    )
+
+    photos = []
+    for b in badges[:10]:
+        if not b.get("iconUrl"):
+            continue
+        name = html.escape(str(b.get("name") or "бейдж"))
+        try:
+            photos.append((client.download(b["iconUrl"]), f"🎖 {name}"))
+        except Exception as exc:  # noqa: BLE001 — без иконки не страшно
+            print(f"badge icon {name}: {type(exc).__name__}: {exc}")
+
+    if photos:
+        send_album(photos, summary)
+    else:
+        send_result("🎖 Бейджи", summary)
+
+
 SIMPLE_ACTIONS = {
     "info": ("Профиль", lambda: client.get(f"/participants/{ME}")),
     "points": ("Поинты", lambda: client.get(f"/participants/{ME}/points")),
@@ -259,7 +359,6 @@ SIMPLE_ACTIONS = {
     "logtime": ("Логтайм (ср. за неделю)", lambda: client.get(f"/participants/{ME}/logtime")),
     "feedback": ("Фидбек", lambda: client.get(f"/participants/{ME}/feedback")),
     "xp": ("История XP", lambda: client.get(f"/participants/{ME}/experience-history", {"limit": 30})),
-    "badges": ("Бейджи", lambda: client.get(f"/participants/{ME}/badges")),
     "coalition": ("Коалиция", lambda: client.get(f"/participants/{ME}/coalition")),
     "workstation": ("Рабочее место", lambda: client.get(f"/participants/{ME}/workstation")),
     "courses": ("Курсы", lambda: client.get(f"/participants/{ME}/courses")),
@@ -272,6 +371,8 @@ def handle_action(action: str) -> None:
     try:
         if action == "ping_reviews":
             action_ping_reviews()
+        elif action == "badges":
+            action_badges()
         elif action == "ping_events":
             action_ping_events()
         elif action.startswith("proj:"):
@@ -314,16 +415,17 @@ STATUS_LABELS = {
 
 def watcher() -> None:
     """Каждые POLL_INTERVAL сек: смена статусов проектов + новые события кампуса."""
-    first_run = True
+    baselined: set[str] = set()  # ники, чьи статусы уже молча запомнили в этой сессии
     while True:
         try:
+            me = ME  # фиксируем на итерацию: /track может сменить ник посреди прохода
             state = load_state()
-            statuses: dict = state.get("statuses", {})
-            seen_events: list = state.get("seen_events", [])
+            statuses: dict = dict(state.get("statuses_by_login", {}).get(me, {}))
+            seen_events: list = list(state.get("seen_events", []))
+            first_run = me not in baselined
 
             # --- статусы проектов ---
-            data = client.get(f"/participants/{ME}/projects", {"limit": 100})
-            for p in data.get("projects") or []:
+            for p in fetch_all_projects(login=me):
                 pid = str(p.get("id"))
                 status = p.get("status")
                 title = html.escape(str(p.get("title") or pid))
@@ -331,7 +433,7 @@ def watcher() -> None:
                     statuses[pid] = status
                     if not first_run:
                         label = STATUS_LABELS.get(status, status)
-                        send_result("Проект изменился", f"<b>{title}</b>: {label}")
+                        send_result(f"Проект изменился ({me})", f"<b>{title}</b>: {label}")
 
             # --- новые события кампуса ---
             now = datetime.now(timezone.utc)
@@ -344,7 +446,7 @@ def watcher() -> None:
                 if eid in seen_events:
                     continue
                 seen_events.append(eid)
-                if not first_run:
+                if baselined:  # события не зависят от ника: молчим только на самом первом проходе
                     name = html.escape(str(e.get("name") or "событие"))
                     etype = html.escape(str(e.get("type") or ""))
                     location = html.escape(str(e.get("location") or "?"))
@@ -357,10 +459,13 @@ def watcher() -> None:
                         f"👥 мест: {capacity}, записалось: {registered}",
                     )
 
-            state["statuses"] = statuses
-            state["seen_events"] = seen_events[-500:]
-            save_state(state)
-            first_run = False
+            def _save(s: dict) -> None:
+                s.setdefault("statuses_by_login", {})[me] = statuses
+                s["seen_events"] = seen_events[-500:]
+                s.pop("statuses", None)  # старый формат, теперь statuses_by_login
+
+            update_state(_save)
+            baselined.add(me)
         except Exception as exc:  # noqa: BLE001
             print(f"watcher: {type(exc).__name__}: {exc}")
         time.sleep(POLL_INTERVAL)
@@ -377,11 +482,19 @@ def handle_callback(cq: dict) -> None:
         tg("deleteMessage", chat_id=TG_CHAT_ID, message_id=message_id)
         return
 
+    if data.startswith("delA:"):
+        # удалить весь альбом + само сообщение с кнопкой
+        album_ids: list[int] = []
+        update_state(lambda s: album_ids.extend(s.get("albums", {}).pop(data[5:], [])))
+        for mid in album_ids + [message_id]:
+            tg("deleteMessage", chat_id=TG_CHAT_ID, message_id=mid)
+        return
+
     if data.startswith("m:") or data.startswith("c:"):
         # навигация: меню всегда редактируется, никогда не удаляется
         try:
             if data == "m:main":
-                text, keyboard = MAIN_MENU
+                text, keyboard = main_menu()
             elif data == "m:profile":
                 text, keyboard = PROFILE_MENU
             elif data == "m:projects":
@@ -423,8 +536,14 @@ def main() -> None:
 
             message = update.get("message")
             if message and message["chat"]["id"] == TG_CHAT_ID:
-                text, keyboard = MAIN_MENU
-                send(text, keyboard)
+                text_in = (message.get("text") or "").strip()
+                if text_in.startswith("/track"):
+                    set_track(text_in[len("/track"):])
+                    suffix = "" if ME != DEFAULT_ME else " (свой)"
+                    send(f"👁 Теперь слежу за: <b>{html.escape(ME)}</b>{suffix}")
+                else:
+                    text, keyboard = main_menu()
+                    send(text, keyboard)
 
             cq = update.get("callback_query")
             if cq and cq["message"]["chat"]["id"] == TG_CHAT_ID:
