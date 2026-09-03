@@ -2,7 +2,7 @@
 Поллинг статусов проектов School21 и уведомление в Telegram при их изменении.
 
 Настройки — в .env (см. .env.example). Запуск:
-    python3 main.py
+     python3 main.py
 """
 
 from __future__ import annotations
